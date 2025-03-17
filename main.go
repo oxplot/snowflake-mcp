@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log"
 	"regexp"
-	"strings"
 
 	"github.com/jmoiron/sqlx"
 
@@ -208,10 +207,6 @@ func run() error {
 
 		query, _ := request.Params.Arguments["query"].(string)
 		const maxResultRows = 1000
-
-		if strings.HasPrefix(strings.TrimSpace(strings.ToLower(query)), "show") {
-			return nil, fmt.Errorf("Please use the appropriate resource to get schema")
-		}
 
 		// Execute the query.
 		rows, err := db.QueryxContext(ctx, query)
