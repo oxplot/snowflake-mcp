@@ -5,21 +5,17 @@ supported in order to avoid storing Snowflake credentials on disk.
 defence against a malicious/misbehaving LLM is the permissions you grant
 to the Snowflake account.**
 
-## Build
-
-```sh
-go build
-```
-
 ## Use with Claude Code CLI
 
 ```sh
 claude mcp add-json snowflake '{
-    "command": "/absolute/path/to/snowflake-mcp",
-    "args": [
-      "-account=PPXXXXX-XXXXXXX",
-      "-role=reporter"
-    ]
+  "command": "go",
+  "args": [
+    "run",
+    "github.com/oxplot/snowflake-mcp@latest",
+    "-account=PPXXXXX-XXXXXXX",
+    "-role=reporter"
+  ]
 }'
 
 ```
