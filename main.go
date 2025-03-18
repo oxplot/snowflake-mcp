@@ -82,22 +82,23 @@ func run() error {
 		}
 
 		// Fetch the rows.
-		rowsMap := []map[string]any{}
+		rowsSlice := [][]any{}
 		for rows.Next() {
-			r := map[string]any{}
-			if err := rows.MapScan(r); err != nil {
+			r := []any{}
+			r, err := rows.SliceScan()
+			if err != nil {
 				return nil, fmt.Errorf("Failed to scan row: %v", err)
 			}
-			rowsMap = append(rowsMap, r)
-			if len(rowsMap) >= maxResultRows {
+			rowsSlice = append(rowsSlice, r)
+			if len(rowsSlice) >= maxResultRows {
 				break
 			}
 		}
 
 		result := map[string]any{
 			"column_info": columnInfo,
-			"rows":        rowsMap,
-			"notice":      "Only first 1000 rows are shown",
+			"rows":        rowsSlice,
+			"notice":      fmt.Sprintf("Only first %d rows are shown", maxResultRows),
 		}
 		b := bytes.NewBuffer(nil)
 		jsonEnc := json.NewEncoder(b)
