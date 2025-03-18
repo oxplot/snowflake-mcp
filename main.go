@@ -45,16 +45,10 @@ func run() error {
 	// Add a query tool.
 	mcpServer.AddTool(mcp.NewTool(
 		"query",
-		mcp.WithDescription(`Execute a SQL query.
-        DO NOT use for getting schema (ie do not use SHOW queries).
-        Instead, use the resource snowflake://{database}/{schema}/[table|view]/{name} to get schema of a table|view.
-        Use the resource snowflake://{database}/{schema}/[tables|views] to get list of tables|views in a schema.
-        `),
+		mcp.WithDescription("Execute a SQL query."),
 		mcp.WithString("query",
 			mcp.Required(),
-			mcp.Description(`SQL query to execute.
-            You must use full database.schema.table when referencing tables.
-            `),
+			mcp.Description("SQL query to execute.  You must use full database.schema.table when referencing tables."),
 		),
 	), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 
