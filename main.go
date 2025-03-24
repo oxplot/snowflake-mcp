@@ -38,13 +38,14 @@ func run() error {
 	}
 	connector := gosnowflake.NewConnector(gosnowflake.SnowflakeDriver{}, sfconfig)
 	db := sqlx.NewDb(sql.OpenDB(connector), "snowflake").Unsafe()
-	if err := db.Ping(); err != nil {
-		return fmt.Errorf("Failed to connect to Snowflake: %v", err)
-	}
 
 	// Create MCP server
 
-	mcpServer := server.NewMCPServer("Snowflake", "1.0.0")
+	mcpServer := server.NewMCPServer(
+		"Snowflake",
+		"1.0.0",
+		server.WithResourceCapabilities(false, false),
+	)
 
 	mcpServer.AddResource(mcp.NewResource(
 		"snowflake://",
