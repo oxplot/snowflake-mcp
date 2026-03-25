@@ -6,7 +6,7 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: build-binaries-${{ github.ref }}
@@ -33,16 +33,20 @@ jobs:
       - name: Run tests
         run: go test ./...
 
-      - name: Build release artifacts
+      - name: Compute release tag
+        id: release_tag
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+          tag="v0.0.0-main.${GITHUB_RUN_NUMBER}.${short_sha}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          git tag "${tag}"
+
+      - name: Publish GitHub release
         uses: goreleaser/goreleaser-action@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ steps.release_tag.outputs.tag }}
         with:
           version: "~> v2"
-          args: release --snapshot --clean
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v6
-        with:
-          name: snowflake-mcp-${{ github.sha }}
-          path: dist/*
-          if-no-files-found: error
-          retention-days: 14
+          args: release --clean
