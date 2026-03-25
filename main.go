@@ -64,7 +64,7 @@ func run() error {
 
 	schemaPat := regexp.MustCompile(`^snowflake://([^/]+)$`)
 	mcpServer.AddResourceTemplate(mcp.NewResourceTemplate(
-		"snowflake://{database-name}",
+		"snowflake://{database_name}",
 		"Schema list in database",
 		mcp.WithTemplateDescription("List of schemas in a database"),
 		mcp.WithTemplateMIMEType("text/plain"),
@@ -85,7 +85,7 @@ func run() error {
 
 	tablesPat := regexp.MustCompile(`^snowflake://([^/]+)/([^/]+)/tables$`)
 	mcpServer.AddResourceTemplate(mcp.NewResourceTemplate(
-		"snowflake://{database-name}/{schema-name}/tables",
+		"snowflake://{database_name}/{schema_name}/tables",
 		"Table list in schema",
 		mcp.WithTemplateDescription("List of tables in a schema"),
 		mcp.WithTemplateMIMEType("text/plain"),
@@ -108,7 +108,7 @@ func run() error {
 
 	viewsPat := regexp.MustCompile(`^snowflake://([^/]+)/([^/]+)/views$`)
 	mcpServer.AddResourceTemplate(mcp.NewResourceTemplate(
-		"snowflake://{database-name}/{schema-name}/views",
+		"snowflake://{database_name}/{schema_name}/views",
 		"View list in schema",
 		mcp.WithTemplateDescription("List of views in a schema"),
 		mcp.WithTemplateMIMEType("text/plain"),
@@ -177,14 +177,14 @@ func run() error {
 	}
 
 	mcpServer.AddResourceTemplate(mcp.NewResourceTemplate(
-		"snowflake://{database-name}/{schema-name}/table/{table-name}",
+		"snowflake://{database_name}/{schema_name}/table/{table_name}",
 		"Table definition",
 		mcp.WithTemplateDescription("Definition of a table including columns and column types"),
 		mcp.WithTemplateMIMEType("application/json"),
 	), vtDefHandler)
 
 	mcpServer.AddResourceTemplate(mcp.NewResourceTemplate(
-		"snowflake://{database-name}/{schema-name}/view/{table-name}",
+		"snowflake://{database_name}/{schema_name}/view/{table_name}",
 		"View definition",
 		mcp.WithTemplateDescription("Definition of a view including columns and column types"),
 		mcp.WithTemplateMIMEType("application/json"),
