@@ -25,7 +25,7 @@ func run() error {
 	)
 	flag.Parse()
 	if *snowflakeAccount == "" || *snowflakeRole == "" {
-		return fmt.Errorf("Please provide account and role")
+		return fmt.Errorf("please provide account and role")
 	}
 
 	// Setup connection to snowflake using browser auth
@@ -71,7 +71,7 @@ func run() error {
 	), func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 		m := schemaPat.FindStringSubmatch(request.Params.URI)
 		if m == nil {
-			return nil, fmt.Errorf("Invalid URI")
+			return nil, fmt.Errorf("invalid URI")
 		}
 		dbName := m[1]
 		return getNameList(db, fmt.Sprintf(`SHOW TERSE SCHEMAS IN DATABASE %s`, dbName), func(name string) mcp.ResourceContents {
@@ -92,7 +92,7 @@ func run() error {
 	), func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 		m := tablesPat.FindStringSubmatch(request.Params.URI)
 		if m == nil {
-			return nil, fmt.Errorf("Invalid URI")
+			return nil, fmt.Errorf("invalid URI")
 		}
 		dbName := m[1]
 		schemaName := m[2]
@@ -115,7 +115,7 @@ func run() error {
 	), func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 		m := viewsPat.FindStringSubmatch(request.Params.URI)
 		if m == nil {
-			return nil, fmt.Errorf("Invalid URI")
+			return nil, fmt.Errorf("invalid URI")
 		}
 		dbName, schemaName := m[1], m[2]
 		return getNameList(db, fmt.Sprintf(`SHOW TERSE TABLES IN SCHEMA %s.%s`, dbName, schemaName), func(name string) mcp.ResourceContents {
@@ -131,12 +131,12 @@ func run() error {
 	vtDefHandler := func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
 		m := defPat.FindStringSubmatch(request.Params.URI)
 		if m == nil {
-			return nil, fmt.Errorf("Invalid URI")
+			return nil, fmt.Errorf("invalid URI")
 		}
 		dbName, schemaName, tableName := m[1], m[2], m[3]
 		rows, err := db.Queryx(fmt.Sprintf("DESCRIBE TABLE %s.%s.%s", dbName, schemaName, tableName))
 		if err != nil {
-			return nil, fmt.Errorf("Failed to get table def for %s.%s.%s: %v", dbName, schemaName, tableName, err)
+			return nil, fmt.Errorf("failed to get table def for %s.%s.%s: %v", dbName, schemaName, tableName, err)
 		}
 		defer rows.Close()
 
@@ -150,7 +150,7 @@ func run() error {
 		for rows.Next() {
 			t := column{}
 			if err = rows.StructScan(&t); err != nil {
-				return nil, fmt.Errorf("Failed to scan rows: %v", err)
+				return nil, fmt.Errorf("failed to scan rows: %v", err)
 			}
 			if t.Kind != "COLUMN" {
 				continue
@@ -164,7 +164,7 @@ func run() error {
 		if err := enc.Encode(map[string]any{
 			"columns": columns,
 		}); err != nil {
-			return nil, fmt.Errorf("Failed to marshal result: %v", err)
+			return nil, fmt.Errorf("failed to marshal result: %v", err)
 		}
 
 		return []mcp.ResourceContents{
@@ -199,14 +199,21 @@ func run() error {
 			mcp.Description("SQL query to execute.  You must use full database.schema.table when referencing tables."),
 		),
 	), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-
-		query, _ := request.Params.Arguments["query"].(string)
+		var args struct {
+			Query string `json:"query"`
+		}
+		if err := request.BindArguments(&args); err != nil {
+			return nil, fmt.Errorf("failed to parse query arguments: %v", err)
+		}
+		if args.Query == "" {
+			return nil, fmt.Errorf("missing required query argument")
+		}
 		const maxResultRows = 1000
 
 		// Execute the query.
-		rows, err := db.QueryxContext(ctx, query)
+		rows, err := db.QueryxContext(ctx, args.Query)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to execute query: %v", err)
+			return nil, fmt.Errorf("failed to execute query: %v", err)
 		}
 		defer rows.Close()
 
@@ -214,7 +221,7 @@ func run() error {
 		columnInfo := []map[string]any{}
 		columnTypes, err := rows.ColumnTypes()
 		if err != nil {
-			return nil, fmt.Errorf("Failed to get column types: %v", err)
+			return nil, fmt.Errorf("failed to get column types: %v", err)
 		}
 		for _, columnType := range columnTypes {
 			columnInfo = append(columnInfo, map[string]any{
@@ -226,10 +233,9 @@ func run() error {
 		// Fetch the rows.
 		rowsSlice := [][]any{}
 		for rows.Next() {
-			r := []any{}
 			r, err := rows.SliceScan()
 			if err != nil {
-				return nil, fmt.Errorf("Failed to scan row: %v", err)
+				return nil, fmt.Errorf("failed to scan row: %v", err)
 			}
 			rowsSlice = append(rowsSlice, r)
 			if len(rowsSlice) >= maxResultRows {
@@ -246,7 +252,7 @@ func run() error {
 		jsonEnc := json.NewEncoder(b)
 		jsonEnc.SetIndent("", " ")
 		if err := jsonEnc.Encode(result); err != nil {
-			return nil, fmt.Errorf("Failed to marshal result: %v", err)
+			return nil, fmt.Errorf("failed to marshal result: %v", err)
 		}
 
 		return &mcp.CallToolResult{
@@ -264,7 +270,7 @@ func run() error {
 func getNameList[T any](db *sqlx.DB, query string, conv func(name string) T) ([]T, error) {
 	rows, err := db.Queryx(query)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to run query '%s': %v", query, err)
+		return nil, fmt.Errorf("failed to run query '%s': %v", query, err)
 	}
 	defer rows.Close()
 
@@ -274,7 +280,7 @@ func getNameList[T any](db *sqlx.DB, query string, conv func(name string) T) ([]
 			Name string `db:"name"`
 		}{}
 		if err = rows.StructScan(&t); err != nil {
-			return nil, fmt.Errorf("Failed to scan rows: %v", err)
+			return nil, fmt.Errorf("failed to scan rows: %v", err)
 		}
 		ret = append(ret, conv(t.Name))
 	}
