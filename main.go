@@ -249,7 +249,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  This server does not block writes; restrict Snowflake role permissions.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Example:")
-	fmt.Fprintln(w, "  codex mcp add snowflake -- go run github.com/oxplot/snowflake-mcp@4d60c1c44d6268a98beb0d35da73d7f4f100f5f3")
+	fmt.Fprintln(w, `  codex mcp add snowflake "$(command -v snowflake-mcp)`)
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Options:")
 	fmt.Fprintln(w, "  -h, --help   show help")
