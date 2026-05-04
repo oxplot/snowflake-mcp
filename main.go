@@ -1,14 +1,15 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -21,30 +22,58 @@ import (
 )
 
 const (
-	serverVersion = "1.0.0"
-	maxResultRows = 1000
-	queryTimeout  = 5 * time.Minute
+	serverVersion      = "1.0.0"
+	maxResultRows      = 1000
+	maxResultBytes     = 5 * 1024 * 1024
+	maxCellBytes       = 1 * 1024 * 1024
+	queryTimeout       = 5 * time.Minute
+	queryTimeoutLabel  = "5m"
+	resultBudgetBuffer = 16 * 1024
 
 	maxOpenConnectionsPerTarget = 4
 	maxIdleConnectionsPerTarget = 2
+	maxTargetPools              = 32
 	connectionMaxIdleTime       = 5 * time.Minute
 	connectionMaxLifetime       = 30 * time.Minute
+
+	stdioWorkerPoolSize = 4
+	stdioQueueSize      = 16
 )
 
-var errExitSuccess = errors.New("exit successfully")
+type parseAction int
 
+const (
+	parseActionServe parseAction = iota
+	parseActionExit
+)
+
+const (
+	truncatedByRowLimit   = "row_limit"
+	truncatedByResultSize = "result_size"
+	truncatedByCellSize   = "cell_size"
+)
+
+// queryColumn describes one column in the returned row arrays.
 type queryColumn struct {
 	Name string `json:"name"`
 	Type string `json:"type"`
 }
 
+// queryResult is the structured MCP response for the query tool.
+//
+// Rows are arrays in column order. The server returns at most maxResultRows and
+// also enforces byte budgets so large result sets cannot overwhelm stdio clients.
 type queryResult struct {
-	ColumnInfo   []queryColumn `json:"column_info"`
-	Rows         [][]any       `json:"rows"`
-	ReturnedRows int           `json:"returned_rows"`
-	RowLimit     int           `json:"row_limit"`
-	Truncated    bool          `json:"truncated"`
-	Notice       string        `json:"notice,omitempty"`
+	ColumnInfo      []queryColumn `json:"column_info"`
+	Rows            [][]any       `json:"rows"`
+	ReturnedRows    int           `json:"returned_rows"`
+	RowLimit        int           `json:"row_limit"`
+	ResultBytes     int           `json:"result_bytes"`
+	ResultByteLimit int           `json:"result_byte_limit"`
+	CellByteLimit   int           `json:"cell_byte_limit"`
+	Truncated       bool          `json:"truncated"`
+	TruncatedReason string        `json:"truncated_reason,omitempty"`
+	Notice          string        `json:"notice,omitempty"`
 }
 
 type snowflakeTarget struct {
@@ -76,18 +105,27 @@ func (t snowflakeTarget) String() string {
 }
 
 type connectionManager struct {
-	mu   sync.Mutex
-	dbs  map[snowflakeTarget]*sqlx.DB
-	open func(snowflakeTarget) (*sqlx.DB, error)
+	mu         sync.Mutex
+	dbs        map[snowflakeTarget]*sqlx.DB
+	open       func(snowflakeTarget) (*sqlx.DB, error)
+	maxTargets int
 }
 
 func newConnectionManager(open func(snowflakeTarget) (*sqlx.DB, error)) *connectionManager {
+	return newConnectionManagerWithLimit(open, maxTargetPools)
+}
+
+func newConnectionManagerWithLimit(open func(snowflakeTarget) (*sqlx.DB, error), maxTargets int) *connectionManager {
 	if open == nil {
 		open = openSnowflakeDB
 	}
+	if maxTargets <= 0 {
+		maxTargets = maxTargetPools
+	}
 	return &connectionManager{
-		dbs:  make(map[snowflakeTarget]*sqlx.DB),
-		open: open,
+		dbs:        make(map[snowflakeTarget]*sqlx.DB),
+		open:       open,
+		maxTargets: maxTargets,
 	}
 }
 
@@ -97,6 +135,9 @@ func (m *connectionManager) DB(target snowflakeTarget) (*sqlx.DB, error) {
 
 	if db, ok := m.dbs[target]; ok {
 		return db, nil
+	}
+	if len(m.dbs) >= m.maxTargets {
+		return nil, fmt.Errorf("too many Snowflake targets are open: maximum is %d distinct account/role/warehouse pools", m.maxTargets)
 	}
 	db, err := m.open(target)
 	if err != nil {
@@ -139,56 +180,137 @@ func openSnowflakeDB(target snowflakeTarget) (*sqlx.DB, error) {
 }
 
 func run() error {
-	if err := parseArgs(os.Args[1:]); err != nil {
+	action, err := parseArgs(os.Args[1:])
+	if err != nil {
 		return err
+	}
+	if action == parseActionExit {
+		return nil
 	}
 
 	connections := newConnectionManager(openSnowflakeDB)
 
-	mcpServer := server.NewMCPServer("Snowflake", serverVersion)
+	mcpServer := server.NewMCPServer("Snowflake", serverVersion, server.WithRecovery())
 	addQueryTool(mcpServer, connections)
 
-	err := server.ServeStdio(mcpServer)
+	err = server.ServeStdio(
+		mcpServer,
+		server.WithWorkerPoolSize(stdioWorkerPoolSize),
+		server.WithQueueSize(stdioQueueSize),
+	)
 	if closeErr := connections.Close(); closeErr != nil {
 		return errors.Join(err, fmt.Errorf("failed to close snowflake connections: %w", closeErr))
 	}
 	return err
 }
 
-func parseArgs(args []string) error {
+func parseArgs(args []string) (parseAction, error) {
+	if hasHelpFlag(args) {
+		printUsage(os.Stdout)
+		return parseActionExit, nil
+	}
+
 	fs := flag.NewFlagSet("snowflake-mcp", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
+	fs.SetOutput(io.Discard)
 	version := fs.Bool("version", false, "print version")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: snowflake-mcp [--version]\n\n")
-		fmt.Fprintf(fs.Output(), "Runs an MCP server over stdio for Snowflake SQL queries.\n")
-		fmt.Fprintf(fs.Output(), "Snowflake account, role, warehouse, and SQL are supplied by MCP query tool calls.\n\n")
-		fmt.Fprintf(fs.Output(), "Example:\n")
-		fmt.Fprintf(fs.Output(), "  codex mcp add snowflake -- go run github.com/oxplot/snowflake-mcp@4d60c1c44d6268a98beb0d35da73d7f4f100f5f3\n\n")
-		fmt.Fprintf(fs.Output(), "Options:\n")
-		fmt.Fprintf(fs.Output(), "  -h, --help   show help\n")
-		fmt.Fprintf(fs.Output(), "  --version    print version\n")
+		printUsage(fs.Output())
 	}
 	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return err
-		}
-		return err
+		return parseActionExit, formatFlagParseError(args, err)
 	}
 	if *version {
-		fmt.Fprintf(os.Stdout, "snowflake-mcp %s\n", serverVersion)
-		return errExitSuccess
+		fmt.Fprintln(os.Stdout, versionString())
+		return parseActionExit, nil
 	}
 	if fs.NArg() != 0 {
-		return fmt.Errorf("unexpected command-line argument %q", fs.Arg(0))
+		return parseActionExit, fmt.Errorf("unexpected command-line argument %q\nThis command starts an MCP stdio server and does not accept positional arguments.\nRun snowflake-mcp --help for setup", fs.Arg(0))
 	}
-	return nil
+	return parseActionServe, nil
+}
+
+func hasHelpFlag(args []string) bool {
+	for _, arg := range args {
+		if arg == "-h" || arg == "--help" || arg == "-help" {
+			return true
+		}
+	}
+	return false
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage: snowflake-mcp [--version]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Runs an MCP server over stdio for Snowflake SQL queries.")
+	fmt.Fprintln(w, "Snowflake account, role, warehouse, and SQL are supplied by MCP query tool calls.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Safety:")
+	fmt.Fprintln(w, "  The MCP client chooses the Snowflake account, role, warehouse, and SQL for each query.")
+	fmt.Fprintln(w, "  This server does not block writes; restrict Snowflake role permissions.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Example:")
+	fmt.Fprintln(w, "  codex mcp add snowflake -- go run github.com/oxplot/snowflake-mcp@4d60c1c44d6268a98beb0d35da73d7f4f100f5f3")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Options:")
+	fmt.Fprintln(w, "  -h, --help   show help")
+	fmt.Fprintln(w, "  --version    print version")
+}
+
+func formatFlagParseError(args []string, err error) error {
+	if strings.Contains(err.Error(), "flag provided but not defined") {
+		return fmt.Errorf("unknown option %s\nAccount, role, warehouse, and SQL are MCP query tool arguments, not process flags.\nRun snowflake-mcp --help for setup", unknownFlag(args))
+	}
+	return fmt.Errorf("%v\nRun snowflake-mcp --help for setup", err)
+}
+
+func unknownFlag(args []string) string {
+	for _, arg := range args {
+		if !strings.HasPrefix(arg, "-") || arg == "-" {
+			continue
+		}
+		name, _, _ := strings.Cut(arg, "=")
+		if name == "-h" || name == "--help" || name == "-help" || name == "--version" || name == "-version" {
+			continue
+		}
+		if strings.HasPrefix(name, "--") {
+			return name
+		}
+		return "-" + strings.TrimLeft(name, "-")
+	}
+	return "<unknown>"
+}
+
+func versionString() string {
+	revision := "unknown"
+	modified := false
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, setting := range info.Settings {
+			switch setting.Key {
+			case "vcs.revision":
+				revision = setting.Value
+			case "vcs.modified":
+				modified = setting.Value == "true"
+			}
+		}
+	}
+	if len(revision) > 12 {
+		revision = revision[:12]
+	}
+	if modified {
+		revision += "+modified"
+	}
+	return fmt.Sprintf("snowflake-mcp %s commit=%s", serverVersion, revision)
 }
 
 func addQueryTool(mcpServer *server.MCPServer, connections *connectionManager) {
 	mcpServer.AddTool(mcp.NewTool(
 		"query",
-		mcp.WithDescription("Execute SQL against Snowflake using the requested account, role, and optional warehouse. Returns at most 1000 rows as structured content. This server does not block writes; Snowflake RBAC is the permission boundary."),
+		mcp.WithDescription("Execute SQL against Snowflake using the requested account, role, and optional warehouse. Returns at most 1000 rows as structured content. This server does not block writes or allowlist targets; Snowflake RBAC is the permission boundary."),
+		mcp.WithTitleAnnotation("Snowflake SQL Query"),
+		mcp.WithReadOnlyHintAnnotation(false),
+		mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(false),
+		mcp.WithOpenWorldHintAnnotation(true),
 		mcp.WithString("account",
 			mcp.Required(),
 			mcp.Description("Snowflake account identifier to connect to, for example PPXXXXX-XXXXXXX."),
@@ -242,24 +364,27 @@ func executeQuery(ctx context.Context, db *sqlx.DB, target snowflakeTarget, quer
 
 	conn, err := db.Connx(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get snowflake connection for %s: %w", target, err)
+		return nil, snowflakeQueryError(ctx, target, "failed to get snowflake connection", err)
 	}
 	defer conn.Close()
 
 	if err := useSnowflakeTarget(ctx, conn, target); err != nil {
+		if queryTimedOut(ctx, err) {
+			return nil, queryTimeoutError(target)
+		}
 		return nil, err
 	}
 
 	rows, err := conn.QueryxContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute query for %s: %w", target, err)
+		return nil, snowflakeQueryError(ctx, target, "failed to execute query", err)
 	}
 	defer rows.Close()
 
 	columnInfo := []queryColumn{}
 	columnTypes, err := rows.ColumnTypes()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get column types for %s: %w", target, err)
+		return nil, snowflakeQueryError(ctx, target, "failed to get column types", err)
 	}
 	for _, columnType := range columnTypes {
 		columnInfo = append(columnInfo, queryColumn{
@@ -269,43 +394,186 @@ func executeQuery(ctx context.Context, db *sqlx.DB, target snowflakeTarget, quer
 	}
 
 	rowsSlice := [][]any{}
-	truncated := false
+	rowsJSONBytes := 0
+	truncatedReason := ""
 	for rows.Next() {
 		r, err := rows.SliceScan()
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan row for %s: %w", target, err)
+			return nil, snowflakeQueryError(ctx, target, "failed to scan row", err)
 		}
 		if len(rowsSlice) >= maxResultRows {
-			truncated = true
+			truncatedReason = truncatedByRowLimit
+			break
+		}
+		oversizedCell, err := rowHasOversizedCell(r)
+		if err != nil {
+			return nil, fmt.Errorf("failed to measure row for %s: %w", target, err)
+		}
+		if oversizedCell {
+			truncatedReason = truncatedByCellSize
+			break
+		}
+		rowBytes, err := rowJSONSize(r)
+		if err != nil {
+			return nil, fmt.Errorf("failed to measure row for %s: %w", target, err)
+		}
+		nextRowsJSONBytes := rowsJSONBytes + rowBytes
+		if len(rowsSlice) > 0 {
+			nextRowsJSONBytes++
+		}
+		if nextRowsJSONBytes+resultBudgetBuffer > maxResultBytes {
+			truncatedReason = truncatedByResultSize
 			break
 		}
 		rowsSlice = append(rowsSlice, r)
+		rowsJSONBytes = nextRowsJSONBytes
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to read rows for %s: %w", target, err)
+		return nil, snowflakeQueryError(ctx, target, "failed to read rows", err)
 	}
 
 	result := queryResult{
-		ColumnInfo:   columnInfo,
-		Rows:         rowsSlice,
-		ReturnedRows: len(rowsSlice),
-		RowLimit:     maxResultRows,
-		Truncated:    truncated,
+		ColumnInfo:      columnInfo,
+		Rows:            rowsSlice,
+		ReturnedRows:    len(rowsSlice),
+		RowLimit:        maxResultRows,
+		ResultByteLimit: maxResultBytes,
+		CellByteLimit:   maxCellBytes,
+		Truncated:       truncatedReason != "",
+		TruncatedReason: truncatedReason,
 	}
-	if truncated {
-		result.Notice = fmt.Sprintf("Only first %d rows are shown", maxResultRows)
+	if result.Truncated {
+		result.Notice = truncationNotice(truncatedReason)
+	}
+	if err := fitQueryResultToBudget(&result); err != nil {
+		return nil, err
 	}
 	return newQueryToolResult(result)
 }
 
 func newQueryToolResult(result queryResult) (*mcp.CallToolResult, error) {
-	b := bytes.NewBuffer(nil)
-	jsonEnc := json.NewEncoder(b)
-	jsonEnc.SetIndent("", " ")
-	if err := jsonEnc.Encode(result); err != nil {
-		return nil, fmt.Errorf("failed to marshal query result: %w", err)
+	summary := fmt.Sprintf(
+		"Returned %d rows (row_limit=%d, result_bytes=%d, result_byte_limit=%d, truncated=%t)",
+		result.ReturnedRows,
+		result.RowLimit,
+		result.ResultBytes,
+		result.ResultByteLimit,
+		result.Truncated,
+	)
+	if result.TruncatedReason != "" {
+		summary += fmt.Sprintf(" reason=%s", result.TruncatedReason)
 	}
-	return mcp.NewToolResultStructured(result, b.String()), nil
+	if result.Notice != "" {
+		summary += ". " + result.Notice
+	}
+	return mcp.NewToolResultStructured(result, summary), nil
+}
+
+func fitQueryResultToBudget(result *queryResult) error {
+	result.ReturnedRows = len(result.Rows)
+	result.RowLimit = maxResultRows
+	result.ResultByteLimit = maxResultBytes
+	result.CellByteLimit = maxCellBytes
+
+	if err := setQueryResultBytes(result); err != nil {
+		return err
+	}
+	for result.ResultBytes > maxResultBytes && len(result.Rows) > 0 {
+		result.Rows = result.Rows[:len(result.Rows)-1]
+		result.ReturnedRows = len(result.Rows)
+		result.Truncated = true
+		result.TruncatedReason = truncatedByResultSize
+		result.Notice = truncationNotice(truncatedByResultSize)
+		if err := setQueryResultBytes(result); err != nil {
+			return err
+		}
+	}
+	if result.ResultBytes > maxResultBytes {
+		return fmt.Errorf("query result metadata exceeded %d byte response limit", maxResultBytes)
+	}
+	return nil
+}
+
+func setQueryResultBytes(result *queryResult) error {
+	for i := 0; i < 8; i++ {
+		b, err := json.Marshal(result)
+		if err != nil {
+			return fmt.Errorf("failed to marshal query result: %w", err)
+		}
+		if result.ResultBytes == len(b) {
+			return nil
+		}
+		result.ResultBytes = len(b)
+	}
+	return nil
+}
+
+func rowHasOversizedCell(row []any) (bool, error) {
+	for _, cell := range row {
+		size, err := cellByteSize(cell)
+		if err != nil {
+			return false, err
+		}
+		if size > maxCellBytes {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func cellByteSize(cell any) (int, error) {
+	switch v := cell.(type) {
+	case nil:
+		return 0, nil
+	case string:
+		return len(v), nil
+	case []byte:
+		return len(v), nil
+	case json.RawMessage:
+		return len(v), nil
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return 0, err
+		}
+		return len(b), nil
+	}
+}
+
+func rowJSONSize(row []any) (int, error) {
+	b, err := json.Marshal(row)
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func truncationNotice(reason string) string {
+	switch reason {
+	case truncatedByRowLimit:
+		return fmt.Sprintf("Only first %d rows are shown", maxResultRows)
+	case truncatedByResultSize:
+		return fmt.Sprintf("Result stopped before the %d byte response limit; narrow the query, select fewer columns, or aggregate results", maxResultBytes)
+	case truncatedByCellSize:
+		return fmt.Sprintf("Result stopped because a cell exceeded the %d byte limit; select smaller values or summarize large fields", maxCellBytes)
+	default:
+		return "Result was truncated"
+	}
+}
+
+func snowflakeQueryError(ctx context.Context, target snowflakeTarget, action string, err error) error {
+	if queryTimedOut(ctx, err) {
+		return queryTimeoutError(target)
+	}
+	return fmt.Errorf("%s for %s: %w", action, target, err)
+}
+
+func queryTimedOut(ctx context.Context, err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)
+}
+
+func queryTimeoutError(target snowflakeTarget) error {
+	return fmt.Errorf("query exceeded %s timeout for %s; narrow the query with LIMIT, filters, or aggregates", queryTimeoutLabel, target)
 }
 
 func useSnowflakeTarget(ctx context.Context, conn *sqlx.Conn, target snowflakeTarget) error {
@@ -324,9 +592,6 @@ func useSnowflakeTarget(ctx context.Context, conn *sqlx.Conn, target snowflakeTa
 
 func main() {
 	if err := run(); err != nil {
-		if errors.Is(err, flag.ErrHelp) || errors.Is(err, errExitSuccess) {
-			return
-		}
 		fmt.Fprintf(os.Stderr, "snowflake-mcp: error: %v\n", err)
 		os.Exit(1)
 	}
