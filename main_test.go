@@ -2,11 +2,13 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
 func TestNewSnowflakeTargetTrimsAndRequiresAccountAndRole(t *testing.T) {
@@ -123,6 +125,42 @@ func TestConnectionManagerOpensOnceForConcurrentSameTarget(t *testing.T) {
 		}
 		if db != first {
 			t.Fatal("manager returned different dbs for concurrent identical target")
+		}
+	}
+}
+
+func TestNewQueryToolResultIncludesStructuredMetadata(t *testing.T) {
+	resultData := queryResult{
+		ColumnInfo: []queryColumn{
+			{Name: "ID", Type: "NUMBER"},
+		},
+		Rows:         [][]any{{float64(1)}},
+		ReturnedRows: 1,
+		RowLimit:     maxResultRows,
+		Truncated:    true,
+		Notice:       "Only first 1000 rows are shown",
+	}
+
+	result, err := newQueryToolResult(resultData)
+	if err != nil {
+		t.Fatalf("newQueryToolResult returned error: %v", err)
+	}
+	if result.IsError {
+		t.Fatal("query result was marked as an error")
+	}
+	if !reflect.DeepEqual(result.StructuredContent, resultData) {
+		t.Fatalf("StructuredContent = %#v, want %#v", result.StructuredContent, resultData)
+	}
+	if len(result.Content) != 1 {
+		t.Fatalf("len(Content) = %d, want 1", len(result.Content))
+	}
+	text, ok := result.Content[0].(mcp.TextContent)
+	if !ok {
+		t.Fatalf("Content[0] = %T, want mcp.TextContent", result.Content[0])
+	}
+	for _, want := range []string{`"returned_rows": 1`, `"row_limit": 1000`, `"truncated": true`} {
+		if !strings.Contains(text.Text, want) {
+			t.Fatalf("text content does not contain %q: %s", want, text.Text)
 		}
 	}
 }

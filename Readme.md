@@ -11,7 +11,7 @@ Authentication uses Snowflake external browser auth only, so the server does not
 - Go 1.26 or newer
 - The Snowflake account identifiers you want the MCP client to query, for example `PPXXXXX-XXXXXXX`
 - The Snowflake roles the MCP client should use
-- Optionally, warehouse names if your roles do not have usable default warehouses
+- Optionally, warehouse names if the authenticated user does not have a usable default warehouse for the selected role
 
 ## Codex CLI
 
@@ -19,7 +19,7 @@ Register the MCP server with Codex by running the Go module directly at a pinned
 
 ```sh
 codex mcp add snowflake -- \
-  go run github.com/oxplot/snowflake-mcp@b61b3603806cafeeb9f42b1654a616b6ae4497eb
+  go run github.com/oxplot/snowflake-mcp@4d60c1c44d6268a98beb0d35da73d7f4f100f5f3
 ```
 
 Then confirm it is registered:
@@ -35,7 +35,7 @@ Equivalent Codex config:
 command = "go"
 args = [
   "run",
-  "github.com/oxplot/snowflake-mcp@b61b3603806cafeeb9f42b1654a616b6ae4497eb",
+  "github.com/oxplot/snowflake-mcp@4d60c1c44d6268a98beb0d35da73d7f4f100f5f3",
 ]
 ```
 
@@ -61,7 +61,9 @@ Example:
 }
 ```
 
-The server keeps a separate Snowflake connection pool for each `account`/`role`/`warehouse` combination and creates each pool lazily on first use. Before each query, it reapplies the requested role and, when provided, warehouse on the checked-out Snowflake connection. On first use of a new combination, Snowflake browser auth will open a browser window so you can sign in interactively.
+Results are returned as JSON text and structured MCP content. `column_info` contains column name/type pairs, `rows` contains row arrays, `returned_rows` reports the number of rows returned, `row_limit` reports the server row cap, and `truncated` reports whether more rows were available. Each query has a 5-minute timeout. The server reads at most the first 1,000 rows; use SQL `LIMIT`, filters, or aggregates for larger result sets.
+
+The server keeps a separate Snowflake connection pool for each `account`/`role`/`warehouse` combination and creates each pool lazily on first use. Before each query, it runs `USE ROLE` and, when `warehouse` is provided, `USE WAREHOUSE`. It does not reset database, schema, session parameters, variables, or temporary objects, so queries should be self-contained and use fully qualified object names when object context matters. On first use of a new combination, Snowflake browser auth will open a browser window so you can sign in interactively.
 
 Inspect metadata through the `query` tool with SQL such as `SHOW DATABASES`, `SHOW SCHEMAS`, or `INFORMATION_SCHEMA` queries.
 
