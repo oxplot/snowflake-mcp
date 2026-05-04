@@ -5,10 +5,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
-	"regexp"
+	"os"
+	"strings"
+	"sync"
 
 	"github.com/jmoiron/sqlx"
 
@@ -17,278 +20,260 @@ import (
 	"github.com/snowflakedb/gosnowflake"
 )
 
-func run() error {
-	var (
-		snowflakeAccount   = flag.String("account", "", "Snowflake account name")
-		snowflakeRole      = flag.String("role", "", "Snowflake role name")
-		snowflakeWarehouse = flag.String("warehouse", "", "Snowflake warehouse name")
-	)
-	flag.Parse()
-	if *snowflakeAccount == "" || *snowflakeRole == "" {
-		return fmt.Errorf("please provide account and role")
+const maxResultRows = 1000
+
+type snowflakeTarget struct {
+	Account   string
+	Role      string
+	Warehouse string
+}
+
+func newSnowflakeTarget(account, role, warehouse string) (snowflakeTarget, error) {
+	target := snowflakeTarget{
+		Account:   strings.TrimSpace(account),
+		Role:      strings.TrimSpace(role),
+		Warehouse: strings.TrimSpace(warehouse),
 	}
+	if target.Account == "" {
+		return snowflakeTarget{}, fmt.Errorf("missing required account argument")
+	}
+	if target.Role == "" {
+		return snowflakeTarget{}, fmt.Errorf("missing required role argument")
+	}
+	return target, nil
+}
 
-	// Setup connection to snowflake using browser auth
+func (t snowflakeTarget) String() string {
+	if t.Warehouse == "" {
+		return fmt.Sprintf("account=%q role=%q warehouse=<default>", t.Account, t.Role)
+	}
+	return fmt.Sprintf("account=%q role=%q warehouse=%q", t.Account, t.Role, t.Warehouse)
+}
 
+type connectionManager struct {
+	mu   sync.Mutex
+	dbs  map[snowflakeTarget]*sqlx.DB
+	open func(snowflakeTarget) (*sqlx.DB, error)
+}
+
+func newConnectionManager(open func(snowflakeTarget) (*sqlx.DB, error)) *connectionManager {
+	if open == nil {
+		open = openSnowflakeDB
+	}
+	return &connectionManager{
+		dbs:  make(map[snowflakeTarget]*sqlx.DB),
+		open: open,
+	}
+}
+
+func (m *connectionManager) DB(target snowflakeTarget) (*sqlx.DB, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if db, ok := m.dbs[target]; ok {
+		return db, nil
+	}
+	db, err := m.open(target)
+	if err != nil {
+		return nil, err
+	}
+	m.dbs[target] = db
+	return db, nil
+}
+
+func (m *connectionManager) Close() error {
+	m.mu.Lock()
+	dbs := make([]*sqlx.DB, 0, len(m.dbs))
+	for target, db := range m.dbs {
+		dbs = append(dbs, db)
+		delete(m.dbs, target)
+	}
+	m.mu.Unlock()
+
+	var closeErr error
+	for _, db := range dbs {
+		closeErr = errors.Join(closeErr, db.Close())
+	}
+	return closeErr
+}
+
+func openSnowflakeDB(target snowflakeTarget) (*sqlx.DB, error) {
 	sfconfig := gosnowflake.Config{
-		Account:       *snowflakeAccount,
-		Role:          *snowflakeRole,
-		Warehouse:     *snowflakeWarehouse,
+		Account:       target.Account,
+		Role:          target.Role,
+		Warehouse:     target.Warehouse,
 		Authenticator: gosnowflake.AuthTypeExternalBrowser,
 	}
 	connector := gosnowflake.NewConnector(gosnowflake.SnowflakeDriver{}, sfconfig)
-	db := sqlx.NewDb(sql.OpenDB(connector), "snowflake").Unsafe()
+	return sqlx.NewDb(sql.OpenDB(connector), "snowflake").Unsafe(), nil
+}
 
-	// Create MCP server
-
-	mcpServer := server.NewMCPServer(
-		"Snowflake",
-		"1.0.0",
-		server.WithResourceCapabilities(false, false),
-	)
-
-	mcpServer.AddResource(mcp.NewResource(
-		"snowflake://",
-		"Database list",
-		mcp.WithResourceDescription("List of databases"),
-		mcp.WithMIMEType("text/plain"),
-	), func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-		return getNameList(db, "SHOW TERSE DATABASES", func(name string) mcp.ResourceContents {
-			return mcp.TextResourceContents{
-				URI:      fmt.Sprintf("snowflake://%s", name),
-				MIMEType: "text/plain",
-				Text:     name,
-			}
-		})
-	})
-
-	schemaPat := regexp.MustCompile(`^snowflake://([^/]+)$`)
-	mcpServer.AddResourceTemplate(mcp.NewResourceTemplate(
-		"snowflake://{database_name}",
-		"Schema list in database",
-		mcp.WithTemplateDescription("List of schemas in a database"),
-		mcp.WithTemplateMIMEType("text/plain"),
-	), func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-		m := schemaPat.FindStringSubmatch(request.Params.URI)
-		if m == nil {
-			return nil, fmt.Errorf("invalid URI")
-		}
-		dbName := m[1]
-		return getNameList(db, fmt.Sprintf(`SHOW TERSE SCHEMAS IN DATABASE %s`, dbName), func(name string) mcp.ResourceContents {
-			return mcp.TextResourceContents{
-				URI:      fmt.Sprintf("snowflake://%s/%s", dbName, name),
-				MIMEType: "text/plain",
-				Text:     name,
-			}
-		})
-	})
-
-	tablesPat := regexp.MustCompile(`^snowflake://([^/]+)/([^/]+)/tables$`)
-	mcpServer.AddResourceTemplate(mcp.NewResourceTemplate(
-		"snowflake://{database_name}/{schema_name}/tables",
-		"Table list in schema",
-		mcp.WithTemplateDescription("List of tables in a schema"),
-		mcp.WithTemplateMIMEType("text/plain"),
-	), func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-		m := tablesPat.FindStringSubmatch(request.Params.URI)
-		if m == nil {
-			return nil, fmt.Errorf("invalid URI")
-		}
-		dbName := m[1]
-		schemaName := m[2]
-
-		return getNameList(db, fmt.Sprintf(`SHOW TERSE TABLES IN SCHEMA %s.%s`, dbName, schemaName), func(name string) mcp.ResourceContents {
-			return mcp.TextResourceContents{
-				URI:      fmt.Sprintf("snowflake://%s/%s/table/%s", dbName, schemaName, name),
-				MIMEType: "text/plain",
-				Text:     name,
-			}
-		})
-	})
-
-	viewsPat := regexp.MustCompile(`^snowflake://([^/]+)/([^/]+)/views$`)
-	mcpServer.AddResourceTemplate(mcp.NewResourceTemplate(
-		"snowflake://{database_name}/{schema_name}/views",
-		"View list in schema",
-		mcp.WithTemplateDescription("List of views in a schema"),
-		mcp.WithTemplateMIMEType("text/plain"),
-	), func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-		m := viewsPat.FindStringSubmatch(request.Params.URI)
-		if m == nil {
-			return nil, fmt.Errorf("invalid URI")
-		}
-		dbName, schemaName := m[1], m[2]
-		return getNameList(db, fmt.Sprintf(`SHOW TERSE TABLES IN SCHEMA %s.%s`, dbName, schemaName), func(name string) mcp.ResourceContents {
-			return mcp.TextResourceContents{
-				URI:      fmt.Sprintf("snowflake://%s/%s/view/%s", dbName, schemaName, name),
-				MIMEType: "text/plain",
-				Text:     name,
-			}
-		})
-	})
-
-	defPat := regexp.MustCompile(`^snowflake://([^/]+)/([^/]+)/(?:view|table)/([^/]+)$`)
-	vtDefHandler := func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-		m := defPat.FindStringSubmatch(request.Params.URI)
-		if m == nil {
-			return nil, fmt.Errorf("invalid URI")
-		}
-		dbName, schemaName, tableName := m[1], m[2], m[3]
-		rows, err := db.Queryx(fmt.Sprintf("DESCRIBE TABLE %s.%s.%s", dbName, schemaName, tableName))
-		if err != nil {
-			return nil, fmt.Errorf("failed to get table def for %s.%s.%s: %v", dbName, schemaName, tableName, err)
-		}
-		defer rows.Close()
-
-		type column struct {
-			Name string `db:"name" json:"name"`
-			Type string `db:"type" json:"type"`
-			Kind string `db:"kind" json:"-"`
-		}
-
-		columns := []column{}
-		for rows.Next() {
-			t := column{}
-			if err = rows.StructScan(&t); err != nil {
-				return nil, fmt.Errorf("failed to scan rows: %v", err)
-			}
-			if t.Kind != "COLUMN" {
-				continue
-			}
-			columns = append(columns, column(t))
-		}
-
-		b := bytes.NewBuffer(nil)
-		enc := json.NewEncoder(b)
-		enc.SetIndent("", " ")
-		if err := enc.Encode(map[string]any{
-			"columns": columns,
-		}); err != nil {
-			return nil, fmt.Errorf("failed to marshal result: %v", err)
-		}
-
-		return []mcp.ResourceContents{
-			mcp.TextResourceContents{
-				URI:      request.Params.URI,
-				MIMEType: "application/json",
-				Text:     b.String(),
-			},
-		}, nil
+func run() error {
+	if err := parseArgs(os.Args[1:]); err != nil {
+		return err
 	}
 
-	mcpServer.AddResourceTemplate(mcp.NewResourceTemplate(
-		"snowflake://{database_name}/{schema_name}/table/{table_name}",
-		"Table definition",
-		mcp.WithTemplateDescription("Definition of a table including columns and column types"),
-		mcp.WithTemplateMIMEType("application/json"),
-	), vtDefHandler)
+	connections := newConnectionManager(openSnowflakeDB)
 
-	mcpServer.AddResourceTemplate(mcp.NewResourceTemplate(
-		"snowflake://{database_name}/{schema_name}/view/{table_name}",
-		"View definition",
-		mcp.WithTemplateDescription("Definition of a view including columns and column types"),
-		mcp.WithTemplateMIMEType("application/json"),
-	), vtDefHandler)
+	mcpServer := server.NewMCPServer("Snowflake", "1.0.0")
+	addQueryTool(mcpServer, connections)
 
-	// Add a query tool.
+	err := server.ServeStdio(mcpServer)
+	if closeErr := connections.Close(); closeErr != nil {
+		return errors.Join(err, fmt.Errorf("failed to close snowflake connections: %w", closeErr))
+	}
+	return err
+}
+
+func parseArgs(args []string) error {
+	fs := flag.NewFlagSet("snowflake-mcp", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage: snowflake-mcp\n\n")
+		fmt.Fprintf(fs.Output(), "Snowflake account, role, and warehouse are supplied to each query tool call, not as process flags.\n")
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return err
+		}
+		return fmt.Errorf("%w; account, role, and warehouse are query tool arguments, not process flags", err)
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected command-line argument %q; account, role, and warehouse are query tool arguments", fs.Arg(0))
+	}
+	return nil
+}
+
+func addQueryTool(mcpServer *server.MCPServer, connections *connectionManager) {
 	mcpServer.AddTool(mcp.NewTool(
 		"query",
-		mcp.WithDescription("Execute a SQL query."),
+		mcp.WithDescription("Execute a Snowflake SQL query against the requested account, role, and warehouse."),
+		mcp.WithString("account",
+			mcp.Required(),
+			mcp.Description("Snowflake account identifier to connect to, for example PPXXXXX-XXXXXXX."),
+		),
+		mcp.WithString("role",
+			mcp.Required(),
+			mcp.Description("Snowflake role to use for this query."),
+		),
+		mcp.WithString("warehouse",
+			mcp.Description("Snowflake warehouse to use for this query. Omit to use the role's default warehouse."),
+		),
 		mcp.WithString("query",
 			mcp.Required(),
-			mcp.Description("SQL query to execute.  You must use full database.schema.table when referencing tables."),
+			mcp.Description("SQL query to execute. You must use full database.schema.table names when referencing tables."),
 		),
 	), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var args struct {
-			Query string `json:"query"`
+			Account   string `json:"account"`
+			Role      string `json:"role"`
+			Warehouse string `json:"warehouse"`
+			Query     string `json:"query"`
 		}
 		if err := request.BindArguments(&args); err != nil {
-			return nil, fmt.Errorf("failed to parse query arguments: %v", err)
+			return nil, fmt.Errorf("failed to parse query arguments: %w", err)
 		}
-		if args.Query == "" {
+		target, err := newSnowflakeTarget(args.Account, args.Role, args.Warehouse)
+		if err != nil {
+			return nil, err
+		}
+		query := strings.TrimSpace(args.Query)
+		if query == "" {
 			return nil, fmt.Errorf("missing required query argument")
 		}
-		const maxResultRows = 1000
 
-		// Execute the query.
-		rows, err := db.QueryxContext(ctx, args.Query)
+		db, err := connections.DB(target)
 		if err != nil {
-			return nil, fmt.Errorf("failed to execute query: %v", err)
+			return nil, fmt.Errorf("failed to initialize snowflake connection for %s: %w", target, err)
 		}
-		defer rows.Close()
-
-		// Get column details.
-		columnInfo := []map[string]any{}
-		columnTypes, err := rows.ColumnTypes()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get column types: %v", err)
-		}
-		for _, columnType := range columnTypes {
-			columnInfo = append(columnInfo, map[string]any{
-				"name": columnType.Name(),
-				"type": columnType.DatabaseTypeName(),
-			})
-		}
-
-		// Fetch the rows.
-		rowsSlice := [][]any{}
-		for rows.Next() {
-			r, err := rows.SliceScan()
-			if err != nil {
-				return nil, fmt.Errorf("failed to scan row: %v", err)
-			}
-			rowsSlice = append(rowsSlice, r)
-			if len(rowsSlice) >= maxResultRows {
-				break
-			}
-		}
-
-		result := map[string]any{
-			"column_info": columnInfo,
-			"rows":        rowsSlice,
-			"notice":      fmt.Sprintf("Only first %d rows are shown", maxResultRows),
-		}
-		b := bytes.NewBuffer(nil)
-		jsonEnc := json.NewEncoder(b)
-		jsonEnc.SetIndent("", " ")
-		if err := jsonEnc.Encode(result); err != nil {
-			return nil, fmt.Errorf("failed to marshal result: %v", err)
-		}
-
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{
-				mcp.TextContent{
-					Type: "text",
-					Text: b.String(),
-				},
-			},
-		}, nil
+		return executeQuery(ctx, db, target, query)
 	})
-	return server.ServeStdio(mcpServer)
 }
 
-func getNameList[T any](db *sqlx.DB, query string, conv func(name string) T) ([]T, error) {
-	rows, err := db.Queryx(query)
+func executeQuery(ctx context.Context, db *sqlx.DB, target snowflakeTarget, query string) (*mcp.CallToolResult, error) {
+	conn, err := db.Connx(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to run query '%s': %v", query, err)
+		return nil, fmt.Errorf("failed to get snowflake connection for %s: %w", target, err)
+	}
+	defer conn.Close()
+
+	if err := useSnowflakeTarget(ctx, conn, target); err != nil {
+		return nil, err
+	}
+
+	rows, err := conn.QueryxContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
 	defer rows.Close()
 
-	ret := []T{}
-	for rows.Next() {
-		t := struct {
-			Name string `db:"name"`
-		}{}
-		if err = rows.StructScan(&t); err != nil {
-			return nil, fmt.Errorf("failed to scan rows: %v", err)
-		}
-		ret = append(ret, conv(t.Name))
+	columnInfo := []map[string]any{}
+	columnTypes, err := rows.ColumnTypes()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get column types: %w", err)
 	}
-	return ret, nil
+	for _, columnType := range columnTypes {
+		columnInfo = append(columnInfo, map[string]any{
+			"name": columnType.Name(),
+			"type": columnType.DatabaseTypeName(),
+		})
+	}
+
+	rowsSlice := [][]any{}
+	for rows.Next() {
+		r, err := rows.SliceScan()
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan row: %w", err)
+		}
+		rowsSlice = append(rowsSlice, r)
+		if len(rowsSlice) >= maxResultRows {
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read rows: %w", err)
+	}
+
+	result := map[string]any{
+		"column_info": columnInfo,
+		"rows":        rowsSlice,
+		"notice":      fmt.Sprintf("Only first %d rows are shown", maxResultRows),
+	}
+	b := bytes.NewBuffer(nil)
+	jsonEnc := json.NewEncoder(b)
+	jsonEnc.SetIndent("", " ")
+	if err := jsonEnc.Encode(result); err != nil {
+		return nil, fmt.Errorf("failed to marshal result: %w", err)
+	}
+
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			mcp.TextContent{
+				Type: "text",
+				Text: b.String(),
+			},
+		},
+	}, nil
+}
+
+func useSnowflakeTarget(ctx context.Context, conn *sqlx.Conn, target snowflakeTarget) error {
+	if _, err := conn.ExecContext(ctx, "USE ROLE IDENTIFIER(?)", target.Role); err != nil {
+		return fmt.Errorf("failed to use role for %s: %w", target, err)
+	}
+	if target.Warehouse == "" {
+		return nil
+	}
+	if _, err := conn.ExecContext(ctx, "USE WAREHOUSE IDENTIFIER(?)", target.Warehouse); err != nil {
+		return fmt.Errorf("failed to use warehouse for %s: %w", target, err)
+	}
+	return nil
 }
 
 func main() {
 	if err := run(); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
 		log.Fatalf("Error: %v", err)
 	}
 }
