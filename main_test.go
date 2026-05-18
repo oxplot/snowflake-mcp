@@ -268,8 +268,74 @@ func TestParseArgsVersionExitsSuccessfully(t *testing.T) {
 	if action != parseActionExit {
 		t.Fatalf("action = %v, want %v", action, parseActionExit)
 	}
-	if got := versionString(); !strings.Contains(got, "snowflake-mcp 1.0.0 commit=") {
+	if got := versionString(); !strings.Contains(got, "snowflake-mcp dev commit=") {
 		t.Fatalf("versionString() = %q", got)
+	}
+}
+
+func TestBuildVersionUsesInjectedReleaseVersion(t *testing.T) {
+	oldVersion := serverVersion
+	serverVersion = "1.2.3"
+	t.Cleanup(func() {
+		serverVersion = oldVersion
+	})
+
+	if got := buildVersion(); got != "1.2.3" {
+		t.Fatalf("buildVersion() = %q, want %q", got, "1.2.3")
+	}
+}
+
+func TestBuildVersionDefaultsToDevForLocalBuild(t *testing.T) {
+	oldVersion := serverVersion
+	serverVersion = "dev"
+	t.Cleanup(func() {
+		serverVersion = oldVersion
+	})
+
+	if got := buildVersion(); got != "dev" {
+		t.Fatalf("buildVersion() = %q, want %q", got, "dev")
+	}
+}
+
+func TestResolveBuildVersionNormalizesGoModuleVersion(t *testing.T) {
+	tests := []struct {
+		name            string
+		injectedVersion string
+		moduleVersion   string
+		want            string
+	}{
+		{
+			name:            "release injection wins",
+			injectedVersion: "1.2.3",
+			moduleVersion:   "v1.2.3",
+			want:            "1.2.3",
+		},
+		{
+			name:            "module version strips tag prefix",
+			injectedVersion: "dev",
+			moduleVersion:   "v1.2.3",
+			want:            "1.2.3",
+		},
+		{
+			name:            "local build stays dev",
+			injectedVersion: "dev",
+			moduleVersion:   "(devel)",
+			want:            "dev",
+		},
+		{
+			name:            "missing module version stays dev",
+			injectedVersion: "dev",
+			moduleVersion:   "",
+			want:            "dev",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolveBuildVersion(tt.injectedVersion, tt.moduleVersion); got != tt.want {
+				t.Fatalf("resolveBuildVersion(%q, %q) = %q, want %q", tt.injectedVersion, tt.moduleVersion, got, tt.want)
+			}
+		})
 	}
 }
 

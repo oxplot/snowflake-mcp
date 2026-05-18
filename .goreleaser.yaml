@@ -1,0 +1,65 @@
+version: 2
+
+project_name: snowflake-mcp
+
+builds:
+  - id: snowflake-mcp
+    main: .
+    binary: snowflake-mcp
+    env:
+      - CGO_ENABLED=0
+      - GOFLAGS=-mod=readonly
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.serverVersion={{ .Version }}
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: snowflake-mcp
+    ids:
+      - snowflake-mcp
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    files:
+      - Readme.md
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+checksum:
+  name_template: checksums.txt
+
+release:
+  github:
+    owner: oxplot
+    name: snowflake-mcp
+
+brews:
+  - name: snowflake-mcp
+    ids:
+      - snowflake-mcp
+    repository:
+      owner: oxplot
+      name: snowflake-mcp
+      branch: main
+    directory: Formula
+    homepage: https://github.com/oxplot/snowflake-mcp
+    description: Local MCP server for querying Snowflake
+    install: |
+      bin.install "snowflake-mcp"
+    test: |
+      system "#{bin}/snowflake-mcp", "--version"
+    caveats: |
+      Register with Codex:
+        codex mcp add snowflake -- snowflake-mcp

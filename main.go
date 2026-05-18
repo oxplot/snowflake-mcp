@@ -22,7 +22,6 @@ import (
 )
 
 const (
-	serverVersion      = "1.0.0"
 	maxResultRows      = 1000
 	maxResultBytes     = 5 * 1024 * 1024
 	maxCellBytes       = 1 * 1024 * 1024
@@ -39,6 +38,10 @@ const (
 	stdioWorkerPoolSize = 4
 	stdioQueueSize      = 16
 )
+
+// serverVersion is set by GoReleaser with -ldflags. Source builds keep "dev"
+// and can still resolve tagged module versions from Go build metadata.
+var serverVersion = "dev"
 
 type parseAction int
 
@@ -190,7 +193,7 @@ func run() error {
 
 	connections := newConnectionManager(openSnowflakeDB)
 
-	mcpServer := server.NewMCPServer("Snowflake", serverVersion, server.WithRecovery())
+	mcpServer := server.NewMCPServer("Snowflake", buildVersion(), server.WithRecovery())
 	addQueryTool(mcpServer, connections)
 
 	err = server.ServeStdio(
@@ -249,7 +252,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  This server does not block writes; restrict Snowflake role permissions.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Example:")
-	fmt.Fprintln(w, `  codex mcp add snowflake "$(command -v snowflake-mcp)`)
+	fmt.Fprintln(w, "  codex mcp add snowflake -- snowflake-mcp")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Options:")
 	fmt.Fprintln(w, "  -h, --help   show help")
@@ -281,6 +284,30 @@ func unknownFlag(args []string) string {
 }
 
 func versionString() string {
+	version := buildVersion()
+	revision := buildRevision()
+	return fmt.Sprintf("snowflake-mcp %s commit=%s", version, revision)
+}
+
+func buildVersion() string {
+	moduleVersion := ""
+	if info, ok := debug.ReadBuildInfo(); ok {
+		moduleVersion = info.Main.Version
+	}
+	return resolveBuildVersion(serverVersion, moduleVersion)
+}
+
+func resolveBuildVersion(injectedVersion, moduleVersion string) string {
+	if injectedVersion != "dev" {
+		return injectedVersion
+	}
+	if moduleVersion == "" || moduleVersion == "(devel)" {
+		return injectedVersion
+	}
+	return strings.TrimPrefix(moduleVersion, "v")
+}
+
+func buildRevision() string {
 	revision := "unknown"
 	modified := false
 	if info, ok := debug.ReadBuildInfo(); ok {
@@ -299,7 +326,7 @@ func versionString() string {
 	if modified {
 		revision += "+modified"
 	}
-	return fmt.Sprintf("snowflake-mcp %s commit=%s", serverVersion, revision)
+	return revision
 }
 
 func addQueryTool(mcpServer *server.MCPServer, connections *connectionManager) {
