@@ -522,7 +522,7 @@ func fitQueryResultToBudget(result *queryResult) error {
 }
 
 func setQueryResultBytes(result *queryResult) error {
-	for i := 0; i < 8; i++ {
+	for range 8 {
 		b, err := json.Marshal(result)
 		if err != nil {
 			return fmt.Errorf("failed to marshal query result: %w", err)
