@@ -88,17 +88,15 @@ func TestConnectionManagerOpensOnceForConcurrentSameTarget(t *testing.T) {
 	var wg sync.WaitGroup
 	dbs := make(chan *sqlx.DB, callers)
 	errs := make(chan error, callers)
-	for i := 0; i < callers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range callers {
+		wg.Go(func() {
 			db, err := manager.DB(target)
 			if err != nil {
 				errs <- err
 				return
 			}
 			dbs <- db
-		}()
+		})
 	}
 
 	select {
@@ -206,7 +204,7 @@ func TestFitQueryResultToBudgetTruncatesOversizedResponse(t *testing.T) {
 		},
 		RowLimit: maxResultRows,
 	}
-	for i := 0; i < maxResultRows; i++ {
+	for range maxResultRows {
 		resultData.Rows = append(resultData.Rows, []any{strings.Repeat("x", 7000)})
 	}
 
