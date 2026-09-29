@@ -5,20 +5,20 @@
 class SnowflakeMcp < Formula
   desc "Local MCP server for querying Snowflake"
   homepage "https://github.com/oxplot/snowflake-mcp"
-  version "1.0.0"
+  version "1.1.0"
 
   on_macos do
     if Hardware::CPU.intel?
-      url "https://github.com/oxplot/snowflake-mcp/releases/download/v1.0.0/snowflake-mcp_darwin_x86_64.tar.gz"
-      sha256 "412798096041b24b8abf0c590065461eb03717bde5bd5a1a614a4f64c1a602d6"
+      url "https://github.com/oxplot/snowflake-mcp/releases/download/v1.1.0/snowflake-mcp_darwin_x86_64.tar.gz"
+      sha256 "b875aab6575482e76791c24d0be0497162df8fb7cbf92bcfd253eb888a0b10a4"
 
       define_method(:install) do
         bin.install "snowflake-mcp"
       end
     end
     if Hardware::CPU.arm?
-      url "https://github.com/oxplot/snowflake-mcp/releases/download/v1.0.0/snowflake-mcp_darwin_arm64.tar.gz"
-      sha256 "2d045a28aef5d7695f53d201bb35e7e409af28bb41e308416ea8a77612ba95ea"
+      url "https://github.com/oxplot/snowflake-mcp/releases/download/v1.1.0/snowflake-mcp_darwin_arm64.tar.gz"
+      sha256 "ed099c29805bd13ce6cf1e631b36582bb475c43b3f0faa0a343c3bf456b24e9b"
 
       define_method(:install) do
         bin.install "snowflake-mcp"
@@ -28,15 +28,15 @@ class SnowflakeMcp < Formula
 
   on_linux do
     if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
-      url "https://github.com/oxplot/snowflake-mcp/releases/download/v1.0.0/snowflake-mcp_linux_x86_64.tar.gz"
-      sha256 "51e96e87fd7c0111bc60c99a83cb2812bc86bb0a16c3bbfdae03c0069102fb0e"
+      url "https://github.com/oxplot/snowflake-mcp/releases/download/v1.1.0/snowflake-mcp_linux_x86_64.tar.gz"
+      sha256 "17fe6679be52d28762c334ea0af199094a3561b5a290ffa9a74847913a01b85a"
       define_method(:install) do
         bin.install "snowflake-mcp"
       end
     end
     if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
-      url "https://github.com/oxplot/snowflake-mcp/releases/download/v1.0.0/snowflake-mcp_linux_arm64.tar.gz"
-      sha256 "5bd7d7303314a66edef6edccbcc375c6cd46528e402945b3c4265546ba9c06f9"
+      url "https://github.com/oxplot/snowflake-mcp/releases/download/v1.1.0/snowflake-mcp_linux_arm64.tar.gz"
+      sha256 "8d92386648d6490ae2382586ea8e5b6e1ec69dcc07992e7d3d37b06cf08a309c"
       define_method(:install) do
         bin.install "snowflake-mcp"
       end
